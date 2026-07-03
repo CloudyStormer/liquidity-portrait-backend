@@ -6,16 +6,18 @@ from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import config
-from auth import exchange_wechat_code, sign_auth_token
+from auth import exchange_wechat_code, sign_auth_token, verify_auth_token
+from photo_tools import create_transparent_portrait, validate_id_photo
 from store import ensure_data_dirs, read_store, update_store
 from users import add_rewarded_bonus, get_usage, get_user, identify_user, list_user_history, update_user_profile
 from utils import format_file_size, make_id, now_iso
+from wechat_security import media_check_async
 
 remove_methods = {"screenshot", "doodle", "selection"}
 
@@ -49,6 +51,7 @@ class PhotoUsageBody(BaseModel):
     sizeId: str = Field(min_length=1)
     sizeName: str = Field(min_length=1)
     imagePath: str = Field(min_length=1)
+    originalImagePath: str | None = None
     createdAt: str = Field(min_length=1)
     status: Literal["completed"]
     backgroundId: str | None = None
@@ -161,7 +164,8 @@ def create_app() -> FastAPI:
         }
 
     @app.patch("/api/users/{user_id}/profile")
-    def update_profile(user_id: str, body: UserProfileBody) -> dict[str, Any]:
+    def update_profile(user_id: str, body: UserProfileBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        require_user_token(authorization, user_id)
         try:
             user = update_user_profile(user_id, body.model_dump())
         except ValueError as exc:
@@ -169,7 +173,8 @@ def create_app() -> FastAPI:
         return {"user": to_public_user(user)}
 
     @app.post("/api/users/{user_id}/avatar")
-    async def upload_avatar(user_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    async def upload_avatar(user_id: str, file: UploadFile = File(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        require_user_token(authorization, user_id)
         user = get_user(user_id)
         if not user:
             raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
@@ -186,10 +191,12 @@ def create_app() -> FastAPI:
         return {"user": to_public_user(updated_user)}
 
     @app.post("/api/photo/usage-records")
-    def photo_usage_records(body: PhotoUsageBody) -> dict[str, Any]:
+    def photo_usage_records(body: PhotoUsageBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
         record = body.model_dump()
         if not record.get("userId") and not record.get("openid"):
             raise HTTPException(status_code=400, detail="USER_ID_OR_OPENID_REQUIRED")
+        if record.get("userId"):
+            require_user_token(authorization, record["userId"])
 
         def mutate(store: dict[str, Any]) -> None:
             records = store["photoUsageRecords"]
@@ -202,6 +209,50 @@ def create_app() -> FastAPI:
         update_store(mutate)
         return {"ok": True, "record": record}
 
+    @app.post("/api/photo/validate")
+    async def validate_photo(
+        image: UploadFile = File(...),
+        userId: str = Form(...),
+        sizeId: str = Form(...),
+        sourceType: Literal["album", "camera"] = Form(...),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        payload = require_user_token(authorization, userId)
+        user = get_user(userId)
+        if not user:
+            raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+
+        suffix = Path(image.filename or "").suffix.lower() or ".jpg"
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            suffix = ".jpg"
+        original_path = config.UPLOAD_DIR / f"{make_id('photo')}{suffix}"
+        with original_path.open("wb") as output:
+            shutil.copyfileobj(image.file, output)
+
+        original_url = public_url_for(original_path)
+        wechat_result = media_check_async(original_url, str(payload.get("openid") or user.get("openid") or ""))
+        validation = validate_id_photo(original_path)
+        if not validation["ok"]:
+            return {
+                "ok": False,
+                "message": validation["issues"][0],
+                "validation": validation,
+                "security": {"traceId": wechat_result.get("trace_id")},
+            }
+
+        processed_path = config.UPLOAD_DIR / "processed" / f"{original_path.stem}.png"
+        create_transparent_portrait(original_path, processed_path)
+        processed_url = f"{config.PUBLIC_BASE_URL}/uploads/processed/{processed_path.name}"
+        return {
+            "ok": True,
+            "message": "照片合规",
+            "imagePath": processed_url,
+            "originalUrl": original_url,
+            "validation": validation,
+            "security": {"traceId": wechat_result.get("trace_id")},
+            "meta": {"sizeId": sizeId, "sourceType": sourceType},
+        }
+
     @app.post("/api/logs")
     def logs(body: ClientLogBody) -> dict[str, bool]:
         log = body.model_dump()
@@ -213,14 +264,16 @@ def create_app() -> FastAPI:
         return {"ok": True}
 
     @app.get("/api/users/{user_id}/usage")
-    def usage(user_id: str) -> dict[str, Any]:
+    def usage(user_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        require_user_token(authorization, user_id)
         user = get_user(user_id)
         if not user:
             raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
         return {"usage": get_usage(user["id"])}
 
     @app.get("/api/users/{user_id}/history")
-    def history(user_id: str, type: str | None = None) -> dict[str, Any]:
+    def history(user_id: str, type: str | None = None, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        require_user_token(authorization, user_id)
         record_type = type if type in {"image", "md5", "photo"} else None
         records = list_user_history(user_id, record_type)
         if record_type == "photo":
@@ -324,8 +377,21 @@ def create_app() -> FastAPI:
     return app
 
 
+def require_user_token(authorization: str | None, user_id: str) -> dict[str, Any]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
+    payload = verify_auth_token(authorization.removeprefix("Bearer ").strip())
+    if payload.get("userId") != user_id:
+        raise HTTPException(status_code=403, detail="USER_FORBIDDEN")
+    return payload
+
+
 def public_url_for(file_path: Path) -> str:
-    return f"{config.PUBLIC_BASE_URL}/uploads/{file_path.name}"
+    try:
+        relative = file_path.resolve().relative_to(config.UPLOAD_DIR.resolve()).as_posix()
+    except ValueError:
+        relative = file_path.name
+    return f"{config.PUBLIC_BASE_URL}/uploads/{relative}"
 
 
 def to_public_user(user: dict[str, Any]) -> dict[str, Any]:
@@ -376,4 +442,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=config.PORT, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=config.PORT, reload=config.UVICORN_RELOAD)
