@@ -4,7 +4,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageChops, ImageFilter, ImageStat
+from PIL import Image, ImageFilter, ImageStat
 
 
 def validate_id_photo(image_path: Path) -> dict[str, Any]:
@@ -75,7 +75,9 @@ def create_transparent_portrait(source_path: Path, target_path: Path) -> None:
                 mask_pixels[x, y] = 255 if keep else 0
 
         mask = mask.filter(ImageFilter.MedianFilter(5)).filter(ImageFilter.GaussianBlur(1.2))
-        alpha = ImageChops.lighter(image.getchannel("A"), mask)
-        image.putalpha(alpha)
+        coverage = float(ImageStat.Stat(mask).mean[0]) / 255
+        if coverage < 0.18:
+            mask = Image.new("L", (width, height), 255)
+        image.putalpha(mask)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(target_path, "PNG")

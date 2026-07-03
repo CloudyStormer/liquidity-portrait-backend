@@ -50,7 +50,7 @@ class PhotoUsageBody(BaseModel):
     sourceType: Literal["album", "camera"] | None = None
     sizeId: str = Field(min_length=1)
     sizeName: str = Field(min_length=1)
-    imagePath: str = Field(min_length=1)
+    imagePath: str | None = None
     originalImagePath: str | None = None
     createdAt: str = Field(min_length=1)
     status: Literal["completed"]
@@ -186,28 +186,36 @@ def create_app() -> FastAPI:
         avatar_path = avatar_dir / f"{user_id}{suffix}"
         with avatar_path.open("wb") as output:
             shutil.copyfileobj(file.file, output)
-        avatar_url = f"{config.PUBLIC_BASE_URL}/uploads/avatars/{avatar_path.name}"
+        avatar_url = public_url_for(avatar_path)
         updated_user = update_user_profile(user_id, {"avatarUrl": avatar_url})
         return {"user": to_public_user(updated_user)}
 
     @app.post("/api/photo/usage-records")
     def photo_usage_records(body: PhotoUsageBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
         record = body.model_dump()
-        if not record.get("userId") and not record.get("openid"):
-            raise HTTPException(status_code=400, detail="USER_ID_OR_OPENID_REQUIRED")
-        if record.get("userId"):
-            require_user_token(authorization, record["userId"])
+        if not record.get("userId"):
+            raise HTTPException(status_code=400, detail="USER_ID_REQUIRED")
+        require_user_token(authorization, record["userId"])
+        stored_record = {
+            "id": record["id"],
+            "userId": record["userId"],
+            "sourceType": record.get("sourceType"),
+            "sizeId": record["sizeId"],
+            "sizeName": record["sizeName"],
+            "createdAt": record["createdAt"],
+            "status": record["status"],
+        }
 
         def mutate(store: dict[str, Any]) -> None:
             records = store["photoUsageRecords"]
-            index = next((idx for idx, item in enumerate(records) if item.get("id") == record["id"]), -1)
+            index = next((idx for idx, item in enumerate(records) if item.get("id") == stored_record["id"]), -1)
             if index >= 0:
-                records[index] = record
+                records[index] = stored_record
             else:
-                records.append(record)
+                records.append(stored_record)
 
         update_store(mutate)
-        return {"ok": True, "record": record}
+        return {"ok": True, "record": stored_record}
 
     @app.post("/api/photo/validate")
     async def validate_photo(
@@ -242,11 +250,10 @@ def create_app() -> FastAPI:
 
         processed_path = config.UPLOAD_DIR / "processed" / f"{original_path.stem}.png"
         create_transparent_portrait(original_path, processed_path)
-        processed_url = f"{config.PUBLIC_BASE_URL}/uploads/processed/{processed_path.name}"
         return {
             "ok": True,
             "message": "照片合规",
-            "imagePath": processed_url,
+            "imagePath": public_url_for(processed_path),
             "originalUrl": original_url,
             "validation": validation,
             "security": {"traceId": wechat_result.get("trace_id")},
@@ -391,7 +398,14 @@ def public_url_for(file_path: Path) -> str:
         relative = file_path.resolve().relative_to(config.UPLOAD_DIR.resolve()).as_posix()
     except ValueError:
         relative = file_path.name
-    return f"{config.PUBLIC_BASE_URL}/uploads/{relative}"
+    return f"{public_base_url()}/uploads/{relative}"
+
+
+def public_base_url() -> str:
+    base_url = (config.PUBLIC_BASE_URL or "").rstrip("/")
+    if not base_url or "localhost" in base_url or "127.0.0.1" in base_url:
+        return "https://api.hgshouse.com/portrait"
+    return base_url
 
 
 def to_public_user(user: dict[str, Any]) -> dict[str, Any]:
