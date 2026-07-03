@@ -1,0 +1,379 @@
+from __future__ import annotations
+
+import hashlib
+import shutil
+from pathlib import Path
+from typing import Any, Literal
+
+import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+import config
+from auth import exchange_wechat_code, sign_auth_token
+from store import ensure_data_dirs, read_store, update_store
+from users import add_rewarded_bonus, get_usage, get_user, identify_user, list_user_history, update_user_profile
+from utils import format_file_size, make_id, now_iso
+
+remove_methods = {"screenshot", "doodle", "selection"}
+
+
+class WechatUserInfo(BaseModel):
+    nickName: str | None = None
+    nickname: str | None = None
+    avatarUrl: str | None = None
+
+
+class WechatLoginBody(BaseModel):
+    code: str = Field(min_length=1)
+    clientId: str = Field(min_length=8)
+    platform: str | None = None
+    userInfo: WechatUserInfo | None = None
+
+
+class IdentifyBody(BaseModel):
+    clientId: str = Field(min_length=8)
+    platform: str | None = None
+    nickname: str | None = None
+    avatarUrl: str | None = None
+    openid: str | None = None
+
+
+class PhotoUsageBody(BaseModel):
+    id: str = Field(min_length=1)
+    userId: str | None = None
+    openid: str | None = None
+    sourceType: Literal["album", "camera"] | None = None
+    sizeId: str = Field(min_length=1)
+    sizeName: str = Field(min_length=1)
+    imagePath: str = Field(min_length=1)
+    createdAt: str = Field(min_length=1)
+    status: Literal["completed"]
+    backgroundId: str | None = None
+    backgroundColor: str | None = None
+
+
+class ClientLogBody(BaseModel):
+    event: str = Field(min_length=1, max_length=80)
+    userId: str | None = None
+    openid: str | None = None
+    platform: str | None = None
+    meta: dict[str, Any] | None = None
+
+
+class RewardBody(BaseModel):
+    userId: str = Field(min_length=1)
+    placement: Literal["quota", "download"] = "quota"
+
+
+class UserProfileBody(BaseModel):
+    nickname: str | None = Field(default=None, max_length=80)
+    avatarUrl: str | None = None
+
+
+def create_app() -> FastAPI:
+    ensure_data_dirs()
+    config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    app = FastAPI(title="Liquidity Portrait Backend")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.mount("/uploads", StaticFiles(directory=str(config.UPLOAD_DIR)), name="uploads")
+
+    @app.get("/health")
+    def health() -> dict[str, Any]:
+        return {"ok": True, "service": "liquidity-portrait-backend", "runtime": "python", "time": now_iso()}
+
+    @app.post("/api/auth/wechat/login")
+    def wechat_login(body: WechatLoginBody) -> dict[str, Any]:
+        wechat_session = exchange_wechat_code(body.code)
+        nickname = None
+        avatar_url = None
+        if body.userInfo:
+            nickname = body.userInfo.nickName or body.userInfo.nickname
+            avatar_url = body.userInfo.avatarUrl
+
+        user = identify_user(
+            {
+                "clientId": body.clientId,
+                "platform": body.platform or "weapp",
+                "nickname": nickname,
+                "avatarUrl": avatar_url,
+                "openid": wechat_session["openid"],
+                "unionid": wechat_session.get("unionid"),
+            }
+        )
+        token = sign_auth_token(user["id"], wechat_session["openid"] or "", user.get("platform") or "weapp")
+
+        def mutate(store: dict[str, Any]) -> None:
+            store["clientLogs"].append(
+                {
+                    "id": make_id("log"),
+                    "event": "auth.wechat.login",
+                    "userId": user["id"],
+                    "openid": user.get("openid"),
+                    "platform": user.get("platform"),
+                    "meta": {"clientId": body.clientId, "hasAvatar": bool(avatar_url)},
+                    "createdAt": now_iso(),
+                }
+            )
+
+        update_store(mutate)
+
+        return {
+            "token": token,
+            "user": {
+                "id": user["id"],
+                "platform": user.get("platform"),
+                "nickname": user.get("nickname"),
+                "avatarUrl": user.get("avatarUrl"),
+                "openid": user.get("openid"),
+                "unionid": user.get("unionid"),
+                "openaiUserId": user.get("openaiUserId"),
+                "createdAt": user.get("createdAt"),
+                "lastSeenAt": user.get("lastSeenAt"),
+            },
+            "usage": get_usage(user["id"]),
+        }
+
+    @app.post("/api/users/identify")
+    def identify(body: IdentifyBody) -> dict[str, Any]:
+        user = identify_user(body.model_dump())
+        return {
+            "user": {
+                "id": user["id"],
+                "platform": user.get("platform"),
+                "nickname": user.get("nickname"),
+                "avatarUrl": user.get("avatarUrl"),
+                "openid": user.get("openid"),
+                "openaiUserId": user.get("openaiUserId"),
+                "createdAt": user.get("createdAt"),
+                "lastSeenAt": user.get("lastSeenAt"),
+            },
+            "usage": get_usage(user["id"]),
+        }
+
+    @app.patch("/api/users/{user_id}/profile")
+    def update_profile(user_id: str, body: UserProfileBody) -> dict[str, Any]:
+        try:
+            user = update_user_profile(user_id, body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="USER_NOT_FOUND") from exc
+        return {"user": to_public_user(user)}
+
+    @app.post("/api/users/{user_id}/avatar")
+    async def upload_avatar(user_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+        user = get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+        suffix = Path(file.filename or "").suffix.lower() or ".jpg"
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            suffix = ".jpg"
+        avatar_dir = config.UPLOAD_DIR / "avatars"
+        avatar_dir.mkdir(parents=True, exist_ok=True)
+        avatar_path = avatar_dir / f"{user_id}{suffix}"
+        with avatar_path.open("wb") as output:
+            shutil.copyfileobj(file.file, output)
+        avatar_url = f"{config.PUBLIC_BASE_URL}/uploads/avatars/{avatar_path.name}"
+        updated_user = update_user_profile(user_id, {"avatarUrl": avatar_url})
+        return {"user": to_public_user(updated_user)}
+
+    @app.post("/api/photo/usage-records")
+    def photo_usage_records(body: PhotoUsageBody) -> dict[str, Any]:
+        record = body.model_dump()
+        if not record.get("userId") and not record.get("openid"):
+            raise HTTPException(status_code=400, detail="USER_ID_OR_OPENID_REQUIRED")
+
+        def mutate(store: dict[str, Any]) -> None:
+            records = store["photoUsageRecords"]
+            index = next((idx for idx, item in enumerate(records) if item.get("id") == record["id"]), -1)
+            if index >= 0:
+                records[index] = record
+            else:
+                records.append(record)
+
+        update_store(mutate)
+        return {"ok": True, "record": record}
+
+    @app.post("/api/logs")
+    def logs(body: ClientLogBody) -> dict[str, bool]:
+        log = body.model_dump()
+
+        def mutate(store: dict[str, Any]) -> None:
+            store["clientLogs"].append({"id": make_id("log"), **log, "createdAt": now_iso()})
+
+        update_store(mutate)
+        return {"ok": True}
+
+    @app.get("/api/users/{user_id}/usage")
+    def usage(user_id: str) -> dict[str, Any]:
+        user = get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+        return {"usage": get_usage(user["id"])}
+
+    @app.get("/api/users/{user_id}/history")
+    def history(user_id: str, type: str | None = None) -> dict[str, Any]:
+        record_type = type if type in {"image", "md5", "photo"} else None
+        records = list_user_history(user_id, record_type)
+        if record_type == "photo":
+            return {"records": records}
+        return {"records": [to_history_item(item) for item in records]}
+
+    @app.post("/api/ads/reward")
+    def reward(body: RewardBody) -> dict[str, Any]:
+        if body.placement == "quota":
+            try:
+                usage_data = add_rewarded_bonus(body.userId)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail="USER_NOT_FOUND") from exc
+        else:
+            usage_data = get_usage(body.userId)
+        return {"ok": True, "usage": usage_data}
+
+    @app.post("/api/process/image")
+    async def process_image(
+        image: UploadFile = File(...),
+        userId: str = Form(...),
+        method: str = Form("screenshot"),
+        markerDataUrl: str | None = Form(None),
+        rightsConfirmed: bool = Form(False),
+    ) -> dict[str, Any]:
+        if method not in remove_methods:
+            raise HTTPException(status_code=400, detail="INVALID_METHOD")
+        if not rightsConfirmed:
+            raise HTTPException(status_code=400, detail="RIGHTS_CONFIRMATION_REQUIRED")
+        user = get_user(userId)
+        if not user:
+            raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+        usage_data = get_usage(user["id"])
+        if usage_data["remaining"] <= 0:
+            raise HTTPException(status_code=429, detail={"error": "QUOTA_EXHAUSTED", "usage": usage_data})
+
+        suffix = Path(image.filename or "").suffix or ".jpg"
+        original_path = config.UPLOAD_DIR / f"{make_id('upload')}{suffix}"
+        with original_path.open("wb") as file:
+            shutil.copyfileobj(image.file, file)
+
+        request_id = f"oai_{make_id('req')}"
+        record = {
+            "id": make_id("pf"),
+            "type": "image",
+            "userId": user["id"],
+            "originalName": image.filename or "image",
+            "originalUrl": public_url_for(original_path),
+            "processedUrl": public_url_for(original_path),
+            "fileSize": original_path.stat().st_size,
+            "method": method,
+            "status": "completed",
+            "provider": "local-preview",
+            "openaiRequestId": request_id,
+            "createdAt": now_iso(),
+        }
+        request_record = {
+            "id": request_id,
+            "userId": user["id"],
+            "openaiUserId": user.get("openaiUserId"),
+            "endpoint": "images.edit",
+            "model": config.OPENAI_IMAGE_MODEL,
+            "status": "skipped",
+            "createdAt": now_iso(),
+        }
+
+        def mutate(store: dict[str, Any]) -> None:
+            store["history"].append(record)
+            store["openaiRequests"].append(request_record)
+
+        update_store(mutate)
+        return {"file": to_processed_file(record), "usage": get_usage(user["id"])}
+
+    @app.post("/api/tools/md5")
+    async def md5_tool(file: UploadFile = File(...), userId: str = Form(...)) -> dict[str, Any]:
+        user = get_user(userId)
+        if not user:
+            raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+
+        content = await file.read()
+        md5 = hashlib.md5(content).hexdigest()
+        store = read_store()
+        duplicate = any(item.get("type") == "md5" and item.get("md5") == md5 for item in store["history"])
+        record = {
+            "id": make_id("md5"),
+            "type": "md5",
+            "userId": user["id"],
+            "fileName": file.filename or "file",
+            "fileSize": len(content),
+            "md5": md5,
+            "duplicate": duplicate,
+            "createdAt": now_iso(),
+        }
+
+        def mutate(next_store: dict[str, Any]) -> None:
+            next_store["history"].append(record)
+
+        update_store(mutate)
+        return {"result": to_md5_result(record)}
+
+    return app
+
+
+def public_url_for(file_path: Path) -> str:
+    return f"{config.PUBLIC_BASE_URL}/uploads/{file_path.name}"
+
+
+def to_public_user(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": user["id"],
+        "platform": user.get("platform"),
+        "nickname": user.get("nickname"),
+        "avatarUrl": user.get("avatarUrl"),
+        "openid": user.get("openid"),
+        "unionid": user.get("unionid"),
+        "openaiUserId": user.get("openaiUserId"),
+        "createdAt": user.get("createdAt"),
+        "lastSeenAt": user.get("lastSeenAt"),
+    }
+
+
+def to_processed_file(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": record["id"],
+        "type": "image",
+        "originalName": record.get("originalName"),
+        "thumb": record.get("originalUrl"),
+        "processedUrl": record.get("processedUrl"),
+        "processTime": record.get("createdAt"),
+        "fileSize": format_file_size(int(record.get("fileSize") or 0)),
+        "method": record.get("method"),
+        "provider": record.get("provider"),
+        "openaiRequestId": record.get("openaiRequestId"),
+    }
+
+
+def to_md5_result(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": record["id"],
+        "fileName": record.get("fileName"),
+        "fileSize": format_file_size(int(record.get("fileSize") or 0)),
+        "md5": record.get("md5"),
+        "calcTime": record.get("createdAt"),
+        "duplicate": record.get("duplicate"),
+    }
+
+
+def to_history_item(record: dict[str, Any]) -> dict[str, Any]:
+    return to_processed_file(record) if record.get("type") == "image" else to_md5_result(record)
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=config.PORT, reload=True)

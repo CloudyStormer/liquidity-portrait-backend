@@ -1,6 +1,10 @@
-node_modules/
-dist/
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
 .env
 data/
 uploads/
 *.log
+node_modules/
+dist/
