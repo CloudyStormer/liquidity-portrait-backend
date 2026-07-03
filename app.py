@@ -174,7 +174,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/users/{user_id}/avatar")
     async def upload_avatar(user_id: str, file: UploadFile = File(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        require_user_token(authorization, user_id)
+        payload = require_user_token(authorization, user_id)
         user = get_user(user_id)
         if not user:
             raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
@@ -187,8 +187,9 @@ def create_app() -> FastAPI:
         with avatar_path.open("wb") as output:
             shutil.copyfileobj(file.file, output)
         avatar_url = public_url_for(avatar_path)
+        security_result = media_check_async(avatar_url, str(payload.get("openid") or user.get("openid") or ""))
         updated_user = update_user_profile(user_id, {"avatarUrl": avatar_url})
-        return {"user": to_public_user(updated_user)}
+        return {"user": to_public_user(updated_user), "security": {"traceId": security_result.get("trace_id")}}
 
     @app.post("/api/photo/usage-records")
     def photo_usage_records(body: PhotoUsageBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -249,7 +250,15 @@ def create_app() -> FastAPI:
             }
 
         processed_path = config.UPLOAD_DIR / "processed" / f"{original_path.stem}.png"
-        create_transparent_portrait(original_path, processed_path)
+        cutout_result = create_transparent_portrait(original_path, processed_path)
+        if not cutout_result.get("ok"):
+            return {
+                "ok": False,
+                "message": cutout_result.get("message") or "人像抠图失败，请使用纯色背景重新拍摄",
+                "validation": validation,
+                "security": {"traceId": wechat_result.get("trace_id")},
+                "cutout": cutout_result,
+            }
         return {
             "ok": True,
             "message": "照片合规",
@@ -257,6 +266,7 @@ def create_app() -> FastAPI:
             "originalUrl": original_url,
             "validation": validation,
             "security": {"traceId": wechat_result.get("trace_id")},
+            "cutout": cutout_result,
             "meta": {"sizeId": sizeId, "sourceType": sourceType},
         }
 
@@ -305,7 +315,9 @@ def create_app() -> FastAPI:
         method: str = Form("screenshot"),
         markerDataUrl: str | None = Form(None),
         rightsConfirmed: bool = Form(False),
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        payload = require_user_token(authorization, userId)
         if method not in remove_methods:
             raise HTTPException(status_code=400, detail="INVALID_METHOD")
         if not rightsConfirmed:
@@ -321,6 +333,8 @@ def create_app() -> FastAPI:
         original_path = config.UPLOAD_DIR / f"{make_id('upload')}{suffix}"
         with original_path.open("wb") as file:
             shutil.copyfileobj(image.file, file)
+        original_url = public_url_for(original_path)
+        security_result = media_check_async(original_url, str(payload.get("openid") or user.get("openid") or ""))
 
         request_id = f"oai_{make_id('req')}"
         record = {
@@ -328,13 +342,14 @@ def create_app() -> FastAPI:
             "type": "image",
             "userId": user["id"],
             "originalName": image.filename or "image",
-            "originalUrl": public_url_for(original_path),
-            "processedUrl": public_url_for(original_path),
+            "originalUrl": original_url,
+            "processedUrl": original_url,
             "fileSize": original_path.stat().st_size,
             "method": method,
             "status": "completed",
             "provider": "local-preview",
             "openaiRequestId": request_id,
+            "wechatSecurityTraceId": security_result.get("trace_id"),
             "createdAt": now_iso(),
         }
         request_record = {

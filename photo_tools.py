@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageFilter, ImageStat
+
+_rembg_session: Any | None = None
 
 
 def validate_id_photo(image_path: Path) -> dict[str, Any]:
@@ -41,43 +42,75 @@ def validate_id_photo(image_path: Path) -> dict[str, Any]:
     }
 
 
-def create_transparent_portrait(source_path: Path, target_path: Path) -> None:
-    with Image.open(source_path) as image:
-        image = image.convert("RGBA")
-        width, height = image.size
-        rgb = image.convert("RGB")
+def create_transparent_portrait(source_path: Path, target_path: Path) -> dict[str, Any]:
+    with Image.open(source_path) as source:
+        source = source.convert("RGBA")
+        segmented = _segment_with_rembg(source) or _segment_with_grabcut(source)
+        if segmented is None:
+            return {"ok": False, "message": "人像抠图失败，请使用纯色背景重新拍摄"}
 
-        sample_points = [
-            (0, 0),
-            (width - 1, 0),
-            (0, height - 1),
-            (width - 1, height - 1),
-            (width // 2, 0),
-            (width // 2, height - 1),
-        ]
-        colors = [rgb.getpixel(point) for point in sample_points]
-        bg = tuple(int(sum(color[index] for color in colors) / len(colors)) for index in range(3))
+        alpha = segmented.getchannel("A").filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.45))
+        coverage = float(ImageStat.Stat(alpha).mean[0]) / 255
+        if coverage < 0.12 or coverage > 0.82:
+            return {"ok": False, "message": "人像边界识别失败，请换纯色背景重新拍摄", "coverage": coverage}
 
-        mask = Image.new("L", (width, height), 0)
-        pixels = rgb.load()
-        mask_pixels = mask.load()
-        center_x = width / 2
-        center_y = height * 0.46
-        radius_x = width * 0.36
-        radius_y = height * 0.43
-
-        for y in range(height):
-            for x in range(width):
-                pixel = pixels[x, y]
-                distance = math.sqrt(sum((pixel[index] - bg[index]) ** 2 for index in range(3)))
-                center_score = ((x - center_x) / radius_x) ** 2 + ((y - center_y) / radius_y) ** 2
-                keep = distance > 34 or center_score < 0.78
-                mask_pixels[x, y] = 255 if keep else 0
-
-        mask = mask.filter(ImageFilter.MedianFilter(5)).filter(ImageFilter.GaussianBlur(1.2))
-        coverage = float(ImageStat.Stat(mask).mean[0]) / 255
-        if coverage < 0.18:
-            mask = Image.new("L", (width, height), 255)
-        image.putalpha(mask)
+        segmented.putalpha(alpha)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        image.save(target_path, "PNG")
+        segmented.save(target_path, "PNG")
+        return {"ok": True, "coverage": coverage}
+
+
+def _segment_with_rembg(source: Image.Image) -> Image.Image | None:
+    global _rembg_session
+    try:
+        from rembg import new_session, remove
+
+        if _rembg_session is None:
+            _rembg_session = new_session("u2netp")
+        result = remove(
+            source,
+            session=_rembg_session,
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=8,
+        )
+        return result.convert("RGBA")
+    except Exception:
+        return None
+
+
+def _segment_with_grabcut(source: Image.Image) -> Image.Image | None:
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None
+
+    rgb = source.convert("RGB")
+    image = np.array(rgb)
+    height, width = image.shape[:2]
+    rect = (
+        max(1, int(width * 0.04)),
+        max(1, int(height * 0.02)),
+        max(2, int(width * 0.92)),
+        max(2, int(height * 0.94)),
+    )
+    mask = np.zeros((height, width), np.uint8)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 7, cv2.GC_INIT_WITH_RECT)
+    except Exception:
+        return None
+
+    foreground = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype("uint8")
+    kernel = np.ones((5, 5), np.uint8)
+    foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, kernel)
+    foreground = cv2.morphologyEx(foreground, cv2.MORPH_CLOSE, kernel)
+    foreground = cv2.GaussianBlur(foreground, (5, 5), 0)
+
+    result = source.copy()
+    result.putalpha(Image.fromarray(foreground, mode="L"))
+    return result

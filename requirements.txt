@@ -3,3 +3,5 @@ uvicorn
 python-dotenv
 python-multipart
 Pillow
+rembg
+opencv-python-headless
