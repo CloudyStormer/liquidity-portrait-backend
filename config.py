@@ -38,3 +38,4 @@ REWARDED_AD_BONUS = int_from_env("REWARDED_AD_BONUS", 3)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 ENABLE_OPENAI_IMAGE_EDIT = os.getenv("ENABLE_OPENAI_IMAGE_EDIT", "").lower() == "true"
+UVICORN_RELOAD = os.getenv("UVICORN_RELOAD", "").lower() == "true"
