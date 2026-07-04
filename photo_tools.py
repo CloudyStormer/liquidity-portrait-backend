@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageFilter, ImageStat
 
-_rembg_session: Any | None = None
+_rembg_sessions: dict[str, Any] = {}
 
 
 def validate_id_photo(image_path: Path) -> dict[str, Any]:
@@ -42,82 +43,115 @@ def validate_id_photo(image_path: Path) -> dict[str, Any]:
     }
 
 
-def create_transparent_portrait(source_path: Path, target_path: Path) -> dict[str, Any]:
+def create_transparent_portrait(source_path: Path, target_path: Path, output_size: tuple[int, int] | None = None) -> dict[str, Any]:
     with Image.open(source_path) as source:
         source = source.convert("RGBA")
-        segmented = _segment_with_grabcut(source) or _segment_with_rembg(source)
+        segmented, model_name, errors = _segment_with_rembg(source)
         if segmented is None:
-            return {"ok": False, "message": "人像抠图失败，请使用纯色背景重新拍摄"}
+            return {"ok": False, "message": "人像抠图失败，请使用纯色背景重新拍摄", "errors": errors}
 
-        alpha = segmented.getchannel("A").filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.45))
+        if output_size:
+            segmented = _compose_to_id_canvas(segmented, output_size)
+
+        alpha = _refine_alpha(segmented.getchannel("A"))
         coverage = float(ImageStat.Stat(alpha).mean[0]) / 255
-        if coverage < 0.10 or coverage > 0.88:
-            return {"ok": False, "message": "人像边界识别失败，请换纯色背景重新拍摄", "coverage": coverage}
+        if coverage < 0.08 or coverage > 0.88:
+            return {"ok": False, "message": "人像边界识别失败，请换纯色背景重新拍摄", "coverage": coverage, "model": model_name}
 
         segmented.putalpha(alpha)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         segmented.save(target_path, "PNG")
-        return {"ok": True, "coverage": coverage}
+        return {
+            "ok": True,
+            "coverage": coverage,
+            "model": model_name,
+            "width": segmented.width,
+            "height": segmented.height,
+        }
 
 
-def _segment_with_rembg(source: Image.Image) -> Image.Image | None:
-    global _rembg_session
+def _segment_with_rembg(source: Image.Image) -> tuple[Image.Image | None, str | None, list[str]]:
+    errors: list[str] = []
     try:
         from rembg import new_session, remove
+    except Exception as exc:
+        return None, None, [f"rembg import failed: {exc.__class__.__name__}: {exc}"]
 
-        if _rembg_session is None:
-            _rembg_session = new_session("u2netp")
-        result = remove(
-            source,
-            session=_rembg_session,
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=10,
-            alpha_matting_erode_size=8,
-        )
-        return result.convert("RGBA")
-    except Exception:
-        return None
+    for model_name in _matting_models():
+        try:
+            session = _rembg_sessions.get(model_name)
+            if session is None:
+                session = new_session(model_name)
+                _rembg_sessions[model_name] = session
+            result = remove(
+                source,
+                session=session,
+                alpha_matting=True,
+                alpha_matting_foreground_threshold=230,
+                alpha_matting_background_threshold=18,
+                alpha_matting_erode_size=2,
+                post_process_mask=True,
+            )
+            return result.convert("RGBA"), model_name
+        except Exception as exc:
+            errors.append(f"{model_name} alpha matting failed: {exc.__class__.__name__}: {exc}")
+            try:
+                session = _rembg_sessions.get(model_name)
+                if session is None:
+                    session = new_session(model_name)
+                    _rembg_sessions[model_name] = session
+                result = remove(source, session=session, post_process_mask=True)
+                return result.convert("RGBA"), model_name, errors
+            except Exception as fallback_exc:
+                errors.append(f"{model_name} fallback failed: {fallback_exc.__class__.__name__}: {fallback_exc}")
+                continue
+
+    return None, None, errors
 
 
-def _segment_with_grabcut(source: Image.Image) -> Image.Image | None:
-    try:
-        import cv2
-        import numpy as np
-    except Exception:
-        return None
+def _matting_models() -> list[str]:
+    configured = os.getenv("PORTRAIT_MATTING_MODELS", "")
+    models = [item.strip() for item in configured.split(",") if item.strip()]
+    return models or ["birefnet-portrait", "u2net_human_seg", "isnet-general-use", "u2net"]
 
-    original_width, original_height = source.size
-    max_side = 900
-    scale = min(1.0, max_side / max(original_width, original_height))
-    working = source.resize((int(original_width * scale), int(original_height * scale))) if scale < 1 else source
-    rgb = working.convert("RGB")
-    image = np.array(rgb)
-    height, width = image.shape[:2]
-    rect = (
-        max(1, int(width * 0.04)),
-        max(1, int(height * 0.02)),
-        max(2, int(width * 0.92)),
-        max(2, int(height * 0.94)),
+
+def _refine_alpha(alpha: Image.Image) -> Image.Image:
+    return alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.35))
+
+
+def _compose_to_id_canvas(segmented: Image.Image, output_size: tuple[int, int]) -> Image.Image:
+    alpha = segmented.getchannel("A")
+    bbox = alpha.point(lambda value: 255 if value > 8 else 0).getbbox()
+    if not bbox:
+        return segmented.resize(output_size, Image.Resampling.LANCZOS)
+
+    left, top, right, bottom = bbox
+    width, height = segmented.size
+    person_width = right - left
+    person_height = bottom - top
+    pad_x = int(person_width * 0.10)
+    pad_top = int(person_height * 0.05)
+    pad_bottom = int(person_height * 0.12)
+    crop_box = (
+        max(0, left - pad_x),
+        max(0, top - pad_top),
+        min(width, right + pad_x),
+        min(height, bottom + pad_bottom),
     )
-    mask = np.zeros((height, width), np.uint8)
-    bgd_model = np.zeros((1, 65), np.float64)
-    fgd_model = np.zeros((1, 65), np.float64)
+    crop = segmented.crop(crop_box)
 
-    try:
-        cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 7, cv2.GC_INIT_WITH_RECT)
-    except Exception:
-        return None
+    target_width, target_height = output_size
+    max_width = target_width * 0.94
+    max_height = target_height * 0.94
+    scale = min(max_width / crop.width, max_height / crop.height)
+    resized_width = max(1, round(crop.width * scale))
+    resized_height = max(1, round(crop.height * scale))
+    crop = crop.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
 
-    foreground = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype("uint8")
-    kernel = np.ones((5, 5), np.uint8)
-    foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, kernel)
-    foreground = cv2.morphologyEx(foreground, cv2.MORPH_CLOSE, kernel)
-    foreground = cv2.GaussianBlur(foreground, (5, 5), 0)
-
-    result = source.copy()
-    alpha = Image.fromarray(foreground, mode="L")
-    if scale < 1:
-        alpha = alpha.resize((original_width, original_height), Image.Resampling.LANCZOS)
-    result.putalpha(alpha)
-    return result
+    canvas = Image.new("RGBA", output_size, (255, 255, 255, 0))
+    x = round((target_width - resized_width) / 2)
+    y = max(round(target_height * 0.035), round((target_height - resized_height) / 2))
+    if y + resized_height > target_height:
+        y = target_height - resized_height
+    canvas.alpha_composite(crop, (x, y))
+    return canvas

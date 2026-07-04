@@ -3,5 +3,5 @@ uvicorn
 python-dotenv
 python-multipart
 Pillow
-rembg
+rembg[cpu]>=2.0.67
 opencv-python-headless

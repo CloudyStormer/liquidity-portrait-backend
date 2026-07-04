@@ -20,6 +20,14 @@ from utils import format_file_size, make_id, now_iso
 from wechat_security import media_check_async
 
 remove_methods = {"screenshot", "doodle", "selection"}
+PHOTO_OUTPUT_SIZES = {
+    "one-inch": (295, 413),
+    "two-inch": (413, 579),
+    "small-one-inch": (260, 378),
+    "large-one-inch": (390, 567),
+    "passport": (390, 567),
+    "social-security": (358, 441),
+}
 
 
 class WechatUserInfo(BaseModel):
@@ -251,7 +259,7 @@ def create_app() -> FastAPI:
 
         processed_path = config.UPLOAD_DIR / "processed" / f"{original_path.stem}.png"
         try:
-            cutout_result = create_transparent_portrait(original_path, processed_path)
+            cutout_result = create_transparent_portrait(original_path, processed_path, PHOTO_OUTPUT_SIZES.get(sizeId))
         except Exception as exc:
             cutout_result = {"ok": False, "message": "人像抠图服务异常，请稍后重试", "error": exc.__class__.__name__}
         if not cutout_result.get("ok"):
