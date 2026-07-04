@@ -45,7 +45,7 @@ def get_wechat_access_token() -> str:
     return str(_token_cache["token"])
 
 
-def media_check_async(media_url: str, openid: str, scene: int = 1) -> dict[str, Any]:
+def media_check_async(media_url: str, openid: str, scene: int = 1, media_type: int = 2) -> dict[str, Any]:
     token = get_wechat_access_token()
     if not token:
         return {"errcode": 0, "errmsg": "dev bypass"}
@@ -54,7 +54,7 @@ def media_check_async(media_url: str, openid: str, scene: int = 1) -> dict[str, 
     payload = json.dumps(
         {
             "media_url": media_url,
-            "media_type": 2,
+            "media_type": media_type,
             "version": 2,
             "openid": openid,
             "scene": scene,

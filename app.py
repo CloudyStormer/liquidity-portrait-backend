@@ -250,7 +250,10 @@ def create_app() -> FastAPI:
             }
 
         processed_path = config.UPLOAD_DIR / "processed" / f"{original_path.stem}.png"
-        cutout_result = create_transparent_portrait(original_path, processed_path)
+        try:
+            cutout_result = create_transparent_portrait(original_path, processed_path)
+        except Exception as exc:
+            cutout_result = {"ok": False, "message": "人像抠图服务异常，请稍后重试", "error": exc.__class__.__name__}
         if not cutout_result.get("ok"):
             return {
                 "ok": False,
@@ -370,12 +373,23 @@ def create_app() -> FastAPI:
         return {"file": to_processed_file(record), "usage": get_usage(user["id"])}
 
     @app.post("/api/tools/md5")
-    async def md5_tool(file: UploadFile = File(...), userId: str = Form(...)) -> dict[str, Any]:
+    async def md5_tool(file: UploadFile = File(...), userId: str = Form(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        payload = require_user_token(authorization, userId)
         user = get_user(userId)
         if not user:
             raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
 
-        content = await file.read()
+        suffix = Path(file.filename or "").suffix.lower() or ".bin"
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp3", ".wav", ".m4a"}:
+            raise HTTPException(status_code=400, detail="UNSUPPORTED_UPLOAD_MEDIA_TYPE")
+        upload_path = config.UPLOAD_DIR / "security" / f"{make_id('security')}{suffix}"
+        upload_path.parent.mkdir(parents=True, exist_ok=True)
+        with upload_path.open("wb") as output:
+            shutil.copyfileobj(file.file, output)
+        media_type = 1 if suffix in {".mp3", ".wav", ".m4a"} else 2
+        security_result = media_check_async(public_url_for(upload_path), str(payload.get("openid") or user.get("openid") or ""), media_type=media_type)
+
+        content = upload_path.read_bytes()
         md5 = hashlib.md5(content).hexdigest()
         store = read_store()
         duplicate = any(item.get("type") == "md5" and item.get("md5") == md5 for item in store["history"])
@@ -387,6 +401,7 @@ def create_app() -> FastAPI:
             "fileSize": len(content),
             "md5": md5,
             "duplicate": duplicate,
+            "wechatSecurityTraceId": security_result.get("trace_id"),
             "createdAt": now_iso(),
         }
 

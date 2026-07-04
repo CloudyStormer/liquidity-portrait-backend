@@ -45,13 +45,13 @@ def validate_id_photo(image_path: Path) -> dict[str, Any]:
 def create_transparent_portrait(source_path: Path, target_path: Path) -> dict[str, Any]:
     with Image.open(source_path) as source:
         source = source.convert("RGBA")
-        segmented = _segment_with_rembg(source) or _segment_with_grabcut(source)
+        segmented = _segment_with_grabcut(source) or _segment_with_rembg(source)
         if segmented is None:
             return {"ok": False, "message": "人像抠图失败，请使用纯色背景重新拍摄"}
 
         alpha = segmented.getchannel("A").filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.45))
         coverage = float(ImageStat.Stat(alpha).mean[0]) / 255
-        if coverage < 0.12 or coverage > 0.82:
+        if coverage < 0.10 or coverage > 0.88:
             return {"ok": False, "message": "人像边界识别失败，请换纯色背景重新拍摄", "coverage": coverage}
 
         segmented.putalpha(alpha)
@@ -87,7 +87,11 @@ def _segment_with_grabcut(source: Image.Image) -> Image.Image | None:
     except Exception:
         return None
 
-    rgb = source.convert("RGB")
+    original_width, original_height = source.size
+    max_side = 900
+    scale = min(1.0, max_side / max(original_width, original_height))
+    working = source.resize((int(original_width * scale), int(original_height * scale))) if scale < 1 else source
+    rgb = working.convert("RGB")
     image = np.array(rgb)
     height, width = image.shape[:2]
     rect = (
@@ -112,5 +116,8 @@ def _segment_with_grabcut(source: Image.Image) -> Image.Image | None:
     foreground = cv2.GaussianBlur(foreground, (5, 5), 0)
 
     result = source.copy()
-    result.putalpha(Image.fromarray(foreground, mode="L"))
+    alpha = Image.fromarray(foreground, mode="L")
+    if scale < 1:
+        alpha = alpha.resize((original_width, original_height), Image.Resampling.LANCZOS)
+    result.putalpha(alpha)
     return result
