@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,7 +14,7 @@ from pydantic import BaseModel, Field
 
 import config
 from auth import exchange_wechat_code, sign_auth_token, verify_auth_token
-from photo_tools import create_transparent_portrait, validate_id_photo
+from photo_tools import create_transparent_portrait, validate_id_photo, warmup_portrait_matting
 from store import ensure_data_dirs, read_store, update_store
 from users import add_rewarded_bonus, get_usage, get_user, identify_user, list_user_history, update_user_profile
 from utils import format_file_size, make_id, now_iso
@@ -97,6 +98,16 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.mount("/uploads", StaticFiles(directory=str(config.UPLOAD_DIR)), name="uploads")
+
+    @app.on_event("startup")
+    def warmup_photo_model() -> None:
+        def run_warmup() -> None:
+            try:
+                warmup_portrait_matting()
+            except Exception:
+                pass
+
+        threading.Thread(target=run_warmup, daemon=True).start()
 
     @app.get("/health")
     def health() -> dict[str, Any]:

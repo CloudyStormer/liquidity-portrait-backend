@@ -3,5 +3,5 @@ uvicorn
 python-dotenv
 python-multipart
 Pillow
-rembg[cpu]>=2.0.67
-opencv-python-headless
+numpy>=1.26
+onnxruntime>=1.18,<2
