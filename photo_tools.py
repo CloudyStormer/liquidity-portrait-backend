@@ -14,6 +14,13 @@ _rembg_sessions: dict[str, Any] = {}
 _onnx_sessions: dict[str, Any] = {}
 _WARMUP_DONE = False
 _MATTING_MAX_SIDE = int(os.getenv("PORTRAIT_MATTING_MAX_SIDE", "1280"))
+_DEFAULT_COMPOSE_SPEC = {
+    "width": 413,
+    "height": 579,
+    "topMarginRatio": 0.065,
+    "personWidthRatio": 0.95,
+    "maxPersonHeightRatio": 1.08,
+}
 
 _ONNX_MODEL_SPECS = {
     "u2net_human_seg": {
@@ -72,10 +79,11 @@ def validate_id_photo(image_path: Path) -> dict[str, Any]:
     }
 
 
-def create_transparent_portrait(source_path: Path, target_path: Path, output_size: tuple[int, int] | None = None) -> dict[str, Any]:
+def create_transparent_portrait(source_path: Path, target_path: Path, output_spec: tuple[int, int] | dict[str, Any] | None = None) -> dict[str, Any]:
     with Image.open(source_path) as source:
         source = source.convert("RGBA")
         original_size = source.size
+        compose_spec = _normalize_compose_spec(output_spec)
         source = _resize_for_matting(source)
         segmented, model_name, errors = _segment_portrait(source)
         if segmented is None:
@@ -87,8 +95,8 @@ def create_transparent_portrait(source_path: Path, target_path: Path, output_siz
             return {"ok": False, "message": "人像边界识别失败，请换纯色背景重新拍摄", "coverage": source_coverage, "model": model_name}
         segmented.putalpha(alpha)
 
-        if output_size:
-            segmented = _compose_to_id_canvas(segmented, output_size)
+        if compose_spec:
+            segmented = _compose_to_id_canvas(segmented, compose_spec)
 
         alpha = _finalize_alpha(segmented.getchannel("A"))
         coverage = _alpha_coverage(alpha)
@@ -279,7 +287,8 @@ def _refine_alpha(alpha: Image.Image, source: Image.Image | None = None) -> Imag
 
 
 def _finalize_alpha(alpha: Image.Image) -> Image.Image:
-    return alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.25)).point(_alpha_contrast_curve)
+    alpha = alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    return alpha.filter(ImageFilter.GaussianBlur(0.20)).point(_alpha_contrast_curve)
 
 
 def _alpha_coverage(alpha: Image.Image) -> float:
@@ -287,11 +296,11 @@ def _alpha_coverage(alpha: Image.Image) -> float:
 
 
 def _alpha_contrast_curve(value: int) -> int:
-    if value <= 4:
+    if value <= 16:
         return 0
-    if value >= 250:
+    if value >= 242:
         return 255
-    return value
+    return int(((value - 16) / 226) ** 0.85 * 255)
 
 
 def _keep_primary_portrait_region(alpha: Image.Image) -> Image.Image:
@@ -309,7 +318,7 @@ def _keep_primary_portrait_region(alpha: Image.Image) -> Image.Image:
     ) if scale < 1 else alpha
 
     alpha_array = np.asarray(working_alpha, dtype=np.uint8)
-    hard_mask = alpha_array > 18
+    hard_mask = alpha_array > 36
     height, width = alpha_array.shape
     visited = np.zeros((height, width), dtype=bool)
     center_x = width / 2
@@ -489,39 +498,53 @@ def _largest_mask_bbox(mask: Any) -> tuple[int, int, int, int] | None:
     return best_bbox
 
 
-def _compose_to_id_canvas(segmented: Image.Image, output_size: tuple[int, int]) -> Image.Image:
+def _normalize_compose_spec(output_spec: tuple[int, int] | dict[str, Any] | None) -> dict[str, Any] | None:
+    if output_spec is None:
+        return None
+    if isinstance(output_spec, tuple):
+        return {**_DEFAULT_COMPOSE_SPEC, "width": output_spec[0], "height": output_spec[1]}
+    width = int(output_spec.get("width") or _DEFAULT_COMPOSE_SPEC["width"])
+    height = int(output_spec.get("height") or _DEFAULT_COMPOSE_SPEC["height"])
+    return {
+        **_DEFAULT_COMPOSE_SPEC,
+        **output_spec,
+        "width": width,
+        "height": height,
+    }
+
+
+def _compose_to_id_canvas(segmented: Image.Image, spec: dict[str, Any]) -> Image.Image:
     alpha = segmented.getchannel("A")
     bbox = alpha.point(lambda value: 255 if value > 8 else 0).getbbox()
     if not bbox:
-        return segmented.resize(output_size, Image.Resampling.LANCZOS)
+        return segmented.resize((int(spec["width"]), int(spec["height"])), Image.Resampling.LANCZOS)
 
     left, top, right, bottom = bbox
-    width, height = segmented.size
     person_width = right - left
     person_height = bottom - top
-    pad_x = int(person_width * 0.18)
-    pad_top = int(person_height * 0.05)
-    pad_bottom = int(person_height * 0.20)
-    crop_box = (
-        max(0, left - pad_x),
-        max(0, top - pad_top),
-        min(width, right + pad_x),
-        min(height, bottom + pad_bottom),
-    )
-    crop = segmented.crop(crop_box)
+    target_width = int(spec["width"])
+    target_height = int(spec["height"])
+    person_width_ratio = float(spec.get("personWidthRatio") or _DEFAULT_COMPOSE_SPEC["personWidthRatio"])
+    top_margin_ratio = float(spec.get("topMarginRatio") or _DEFAULT_COMPOSE_SPEC["topMarginRatio"])
+    max_person_height_ratio = float(spec.get("maxPersonHeightRatio") or _DEFAULT_COMPOSE_SPEC["maxPersonHeightRatio"])
 
-    target_width, target_height = output_size
-    max_width = target_width * 0.88
-    max_height = target_height * 0.90
-    scale = min(max_width / crop.width, max_height / crop.height)
-    resized_width = max(1, round(crop.width * scale))
-    resized_height = max(1, round(crop.height * scale))
-    crop = crop.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+    scale_by_width = (target_width * person_width_ratio) / max(person_width, 1)
+    max_scale_by_height = (target_height * max_person_height_ratio) / max(person_height, 1)
+    scale = min(scale_by_width, max_scale_by_height)
 
-    canvas = Image.new("RGBA", output_size, (255, 255, 255, 0))
-    x = round((target_width - resized_width) / 2)
-    y = max(round(target_height * 0.06), round((target_height - resized_height) / 2))
-    if y + resized_height > target_height:
-        y = target_height - resized_height
-    canvas.alpha_composite(crop, (x, y))
+    resized_width = max(1, round(segmented.width * scale))
+    resized_height = max(1, round(segmented.height * scale))
+    resized = segmented.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+
+    person_center_x = (left + right) / 2
+    x = round((target_width / 2) - person_center_x * scale)
+    y = round((target_height * top_margin_ratio) - top * scale)
+    min_bottom = target_height * 0.94
+    if bottom * scale + y < min_bottom:
+        y = round(min_bottom - bottom * scale)
+    if top * scale + y < 0:
+        y = round(-top * scale)
+
+    canvas = Image.new("RGBA", (target_width, target_height), (255, 255, 255, 0))
+    canvas.paste(resized, (x, y), resized)
     return canvas

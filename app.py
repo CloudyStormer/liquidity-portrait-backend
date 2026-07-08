@@ -21,13 +21,13 @@ from utils import format_file_size, make_id, now_iso
 from wechat_security import media_check_async
 
 remove_methods = {"screenshot", "doodle", "selection"}
-PHOTO_OUTPUT_SIZES = {
-    "one-inch": (295, 413),
-    "two-inch": (413, 579),
-    "small-one-inch": (260, 378),
-    "large-one-inch": (390, 567),
-    "passport": (390, 567),
-    "social-security": (358, 441),
+PHOTO_OUTPUT_SPECS = {
+    "one-inch": {"width": 295, "height": 413, "topMarginRatio": 0.065, "personWidthRatio": 0.94, "maxPersonHeightRatio": 1.08},
+    "two-inch": {"width": 413, "height": 579, "topMarginRatio": 0.065, "personWidthRatio": 0.95, "maxPersonHeightRatio": 1.08},
+    "small-one-inch": {"width": 260, "height": 378, "topMarginRatio": 0.065, "personWidthRatio": 0.94, "maxPersonHeightRatio": 1.08},
+    "large-one-inch": {"width": 390, "height": 567, "topMarginRatio": 0.065, "personWidthRatio": 0.95, "maxPersonHeightRatio": 1.08},
+    "passport": {"width": 390, "height": 567, "topMarginRatio": 0.070, "personWidthRatio": 0.94, "maxPersonHeightRatio": 1.06},
+    "social-security": {"width": 358, "height": 441, "topMarginRatio": 0.060, "personWidthRatio": 0.94, "maxPersonHeightRatio": 1.08},
 }
 
 
@@ -270,7 +270,7 @@ def create_app() -> FastAPI:
 
         processed_path = config.UPLOAD_DIR / "processed" / f"{original_path.stem}.png"
         try:
-            cutout_result = create_transparent_portrait(original_path, processed_path, PHOTO_OUTPUT_SIZES.get(sizeId))
+            cutout_result = create_transparent_portrait(original_path, processed_path, PHOTO_OUTPUT_SPECS.get(sizeId, PHOTO_OUTPUT_SPECS["one-inch"]))
         except Exception as exc:
             cutout_result = {"ok": False, "message": "人像抠图服务异常，请稍后重试", "error": exc.__class__.__name__}
         if not cutout_result.get("ok"):
