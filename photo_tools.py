@@ -366,22 +366,6 @@ def _assess_portrait_composition(alpha: Image.Image, source: Image.Image, spec: 
         return {"ok": False, "message": "人像离镜头太远，请靠近后重拍", **metrics}
     if face_width_ratio is not None and face_width_ratio < 0.12:
         return {"ok": False, "message": "头部离镜头太远，请靠近一点重拍", **metrics}
-    too_close = (
-        face_width_ratio is not None
-        and face_width_ratio > 0.62
-        and (top_ratio < 0.04 or person_width_ratio > 0.92)
-    )
-    if too_close:
-        return {"ok": False, "message": "人像离镜头太近或头顶出框，请后退一点重拍", **metrics}
-
-    head_clipped = (
-        face_top_ratio is not None
-        and face_width_ratio is not None
-        and face_top_ratio < 0.025
-        and face_width_ratio > 0.48
-    )
-    if head_clipped:
-        return {"ok": False, "message": "头顶出框，请后退一点重拍", **metrics}
     if center_x_ratio < 0.38 or center_x_ratio > 0.62:
         return {"ok": False, "message": "人像没有居中，请正对镜头重拍", **metrics}
     if face_top_ratio is not None and face_top_ratio > 0.30:
