@@ -425,16 +425,17 @@ def _apply_portrait_shape_prior(alpha: Image.Image, source: Image.Image) -> Imag
     center_x = (left + right + 1) / 2
     y_indices, x_indices = np.indices(alpha_array.shape)
     head_top = max(0, top - int(face_height * 0.45))
-    shoulder_start = bottom + face_height * 0.12
-    shoulder_full = bottom + face_height * 0.85
-    base_half_width = max(face_width * 0.46, alpha.width * 0.18)
-    lower_half_width = max(face_width * 0.62, alpha.width * 0.24)
+    shoulder_start = bottom - face_height * 0.05
+    shoulder_full = bottom + face_height * 1.25
+    base_half_width = max(face_width * 0.78, alpha.width * 0.26)
+    lower_half_width = max(face_width * 1.28, alpha.width * 0.42)
     progress = np.clip((y_indices - shoulder_start) / max(shoulder_full - shoulder_start, 1), 0, 1)
     allowed_half_width = base_half_width + (lower_half_width - base_half_width) * progress
-    allowed_half_width = np.where(y_indices < head_top, face_width * 0.82, allowed_half_width)
+    allowed_half_width = np.where(y_indices < head_top, face_width * 0.90, allowed_half_width)
     allowed = np.abs(x_indices - center_x) <= allowed_half_width
-    protected_head = (y_indices <= bottom + face_height * 0.10) & (np.abs(x_indices - center_x) <= face_width * 0.50)
-    allowed = allowed | protected_head
+    protected_head = (y_indices <= bottom + face_height * 0.10) & (np.abs(x_indices - center_x) <= face_width * 0.58)
+    protected_shoulders = (y_indices >= bottom - face_height * 0.08) & (np.abs(x_indices - center_x) <= lower_half_width)
+    allowed = allowed | protected_head | protected_shoulders
 
     shape_mask = Image.fromarray((allowed.astype(np.uint8) * 255))
     shape_mask = shape_mask.filter(ImageFilter.GaussianBlur(5.0))
@@ -498,9 +499,9 @@ def _compose_to_id_canvas(segmented: Image.Image, output_size: tuple[int, int]) 
     width, height = segmented.size
     person_width = right - left
     person_height = bottom - top
-    pad_x = int(person_width * 0.10)
+    pad_x = int(person_width * 0.18)
     pad_top = int(person_height * 0.05)
-    pad_bottom = int(person_height * 0.12)
+    pad_bottom = int(person_height * 0.20)
     crop_box = (
         max(0, left - pad_x),
         max(0, top - pad_top),
@@ -510,8 +511,8 @@ def _compose_to_id_canvas(segmented: Image.Image, output_size: tuple[int, int]) 
     crop = segmented.crop(crop_box)
 
     target_width, target_height = output_size
-    max_width = target_width * 0.94
-    max_height = target_height * 0.94
+    max_width = target_width * 0.88
+    max_height = target_height * 0.90
     scale = min(max_width / crop.width, max_height / crop.height)
     resized_width = max(1, round(crop.width * scale))
     resized_height = max(1, round(crop.height * scale))
@@ -519,7 +520,7 @@ def _compose_to_id_canvas(segmented: Image.Image, output_size: tuple[int, int]) 
 
     canvas = Image.new("RGBA", output_size, (255, 255, 255, 0))
     x = round((target_width - resized_width) / 2)
-    y = max(round(target_height * 0.035), round((target_height - resized_height) / 2))
+    y = max(round(target_height * 0.06), round((target_height - resized_height) / 2))
     if y + resized_height > target_height:
         y = target_height - resized_height
     canvas.alpha_composite(crop, (x, y))
