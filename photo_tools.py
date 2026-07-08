@@ -89,7 +89,7 @@ def create_transparent_portrait(source_path: Path, target_path: Path, output_spe
         if segmented is None:
             return {"ok": False, "message": "人像抠图失败，请使用纯色背景重新拍摄", "errors": errors}
 
-        alpha = _refine_alpha(segmented.getchannel("A"), source)
+        alpha = _refine_alpha(segmented.getchannel("A"), source, model_name)
         source_coverage = _alpha_coverage(alpha)
         if source_coverage < 0.08 or source_coverage > 0.88:
             return {"ok": False, "message": "人像边界识别失败，请换纯色背景重新拍摄", "coverage": source_coverage, "model": model_name}
@@ -107,7 +107,7 @@ def create_transparent_portrait(source_path: Path, target_path: Path, output_spe
         if compose_spec:
             segmented = _compose_to_id_canvas(segmented, compose_spec)
 
-        alpha = _finalize_alpha(segmented.getchannel("A"))
+        alpha = _finalize_alpha(segmented.getchannel("A"), model_name)
         coverage = _alpha_coverage(alpha)
         if coverage < 0.08 or coverage > 0.88:
             return {"ok": False, "message": "人像边界识别失败，请换纯色背景重新拍摄", "coverage": coverage, "model": model_name}
@@ -148,12 +148,23 @@ def warmup_portrait_matting() -> dict[str, Any]:
 
 
 def _segment_portrait(source: Image.Image) -> tuple[Image.Image | None, str | None, list[str]]:
-    segmented, model_name, errors = _segment_with_onnx(source)
-    if segmented is not None:
-        return segmented, model_name, errors
+    errors: list[str] = []
+    for model_name in _matting_models():
+        if model_name in _ONNX_MODEL_SPECS and not _is_high_quality_model(model_name):
+            segmented, used_model, model_errors = _segment_with_onnx_model(source, model_name)
+        else:
+            segmented, used_model, model_errors = _segment_with_rembg_model(source, model_name)
+            if segmented is None and model_name in _ONNX_MODEL_SPECS:
+                fallback_segmented, fallback_model, fallback_errors = _segment_with_onnx_model(source, model_name)
+                segmented = fallback_segmented
+                used_model = fallback_model
+                model_errors.extend(fallback_errors)
 
-    rembg_segmented, rembg_model_name, rembg_errors = _segment_with_rembg(source)
-    return rembg_segmented, rembg_model_name, errors + rembg_errors
+        errors.extend(model_errors)
+        if segmented is not None:
+            return segmented, used_model, errors
+
+    return None, None, errors
 
 
 def _resize_for_matting(source: Image.Image) -> Image.Image:
@@ -165,7 +176,7 @@ def _resize_for_matting(source: Image.Image) -> Image.Image:
     return source.resize(target_size, Image.Resampling.LANCZOS)
 
 
-def _segment_with_onnx(source: Image.Image) -> tuple[Image.Image | None, str | None, list[str]]:
+def _segment_with_onnx_model(source: Image.Image, model_name: str) -> tuple[Image.Image | None, str | None, list[str]]:
     errors: list[str] = []
     try:
         import numpy as np
@@ -173,84 +184,96 @@ def _segment_with_onnx(source: Image.Image) -> tuple[Image.Image | None, str | N
     except Exception as exc:
         return None, None, [f"onnxruntime import failed: {exc.__class__.__name__}: {exc}"]
 
-    for model_name in _matting_models():
-        if model_name not in _ONNX_MODEL_SPECS:
-            continue
-        try:
-            model_path = _ensure_onnx_model(model_name)
-            session_key = str(model_path)
-            session = _onnx_sessions.get(session_key)
-            if session is None:
-                session_options = ort.SessionOptions()
-                session = ort.InferenceSession(str(model_path), sess_options=session_options, providers=["CPUExecutionProvider"])
-                _onnx_sessions[session_key] = session
+    if model_name not in _ONNX_MODEL_SPECS:
+        return None, None, [f"{model_name} onnx is not configured"]
 
-            rgb = source.convert("RGB")
-            working = rgb.resize((320, 320), Image.Resampling.LANCZOS)
-            image_array = np.asarray(working).astype(np.float32)
-            image_array = image_array / max(float(image_array.max()), 1e-6)
-            mean = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
-            std = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
-            image_array = (image_array - mean) / std
-            image_array = image_array.transpose((2, 0, 1))[None, :, :, :].astype(np.float32)
-            prediction = session.run(None, {session.get_inputs()[0].name: image_array})[0][:, 0, :, :]
-            minimum = float(prediction.min())
-            maximum = float(prediction.max())
-            prediction = (prediction - minimum) / max(maximum - minimum, 1e-6)
-            mask = Image.fromarray((np.squeeze(prediction).clip(0, 1) * 255).astype("uint8"))
-            mask = mask.resize(source.size, Image.Resampling.LANCZOS)
-            result = source.copy()
-            result.putalpha(mask)
-            return result, model_name, errors
-        except Exception as exc:
-            errors.append(f"{model_name} onnx failed: {exc.__class__.__name__}: {exc}")
+    try:
+        model_path = _ensure_onnx_model(model_name)
+        session_key = str(model_path)
+        session = _onnx_sessions.get(session_key)
+        if session is None:
+            session_options = ort.SessionOptions()
+            session = ort.InferenceSession(str(model_path), sess_options=session_options, providers=["CPUExecutionProvider"])
+            _onnx_sessions[session_key] = session
 
-    return None, None, errors
+        rgb = source.convert("RGB")
+        working = rgb.resize((320, 320), Image.Resampling.LANCZOS)
+        image_array = np.asarray(working).astype(np.float32)
+        image_array = image_array / max(float(image_array.max()), 1e-6)
+        mean = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
+        std = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
+        image_array = (image_array - mean) / std
+        image_array = image_array.transpose((2, 0, 1))[None, :, :, :].astype(np.float32)
+        prediction = session.run(None, {session.get_inputs()[0].name: image_array})[0][:, 0, :, :]
+        minimum = float(prediction.min())
+        maximum = float(prediction.max())
+        prediction = (prediction - minimum) / max(maximum - minimum, 1e-6)
+        mask = Image.fromarray((np.squeeze(prediction).clip(0, 1) * 255).astype("uint8"))
+        mask = mask.resize(source.size, Image.Resampling.LANCZOS)
+        result = source.copy()
+        result.putalpha(mask)
+        return result, model_name, errors
+    except Exception as exc:
+        return None, None, [f"{model_name} onnx failed: {exc.__class__.__name__}: {exc}"]
 
 
-def _segment_with_rembg(source: Image.Image) -> tuple[Image.Image | None, str | None, list[str]]:
+def _segment_with_rembg_model(source: Image.Image, model_name: str) -> tuple[Image.Image | None, str | None, list[str]]:
     errors: list[str] = []
     try:
         from rembg import new_session, remove
     except Exception as exc:
         return None, None, [f"rembg import failed: {exc.__class__.__name__}: {exc}"]
 
-    for model_name in _matting_models():
-        try:
-            session = _rembg_sessions.get(model_name)
-            if session is None:
-                session = new_session(model_name)
-                _rembg_sessions[model_name] = session
-            result = remove(source, session=session, post_process_mask=True)
-            return result.convert("RGBA"), model_name, errors
-        except Exception as exc:
-            errors.append(f"{model_name} mask failed: {exc.__class__.__name__}: {exc}")
+    try:
+        session = _rembg_sessions.get(model_name)
+        if session is None:
+            session = new_session(model_name)
+            _rembg_sessions[model_name] = session
+        if _is_high_quality_model(model_name):
+            result = remove(
+                source,
+                session=session,
+                alpha_matting=True,
+                alpha_matting_foreground_threshold=int(os.getenv("PORTRAIT_ALPHA_FOREGROUND_THRESHOLD", "245")),
+                alpha_matting_background_threshold=int(os.getenv("PORTRAIT_ALPHA_BACKGROUND_THRESHOLD", "8")),
+                alpha_matting_erode_size=int(os.getenv("PORTRAIT_ALPHA_ERODE_SIZE", "4")),
+                post_process_mask=True,
+                putalpha=True,
+            )
+        else:
+            result = remove(source, session=session, post_process_mask=True, putalpha=True)
+        return result.convert("RGBA"), model_name, errors
+    except Exception as exc:
+        errors.append(f"{model_name} rembg failed: {exc.__class__.__name__}: {exc}")
+        if _is_high_quality_model(model_name):
             try:
                 session = _rembg_sessions.get(model_name)
                 if session is None:
                     session = new_session(model_name)
                     _rembg_sessions[model_name] = session
-                result = remove(
-                    source,
-                    session=session,
-                    alpha_matting=True,
-                    alpha_matting_foreground_threshold=230,
-                    alpha_matting_background_threshold=18,
-                    alpha_matting_erode_size=2,
-                    post_process_mask=True,
-                )
+                result = remove(source, session=session, post_process_mask=True, putalpha=True)
                 return result.convert("RGBA"), model_name, errors
             except Exception as fallback_exc:
-                errors.append(f"{model_name} alpha matting failed: {fallback_exc.__class__.__name__}: {fallback_exc}")
-                continue
-
-    return None, None, errors
+                errors.append(f"{model_name} mask fallback failed: {fallback_exc.__class__.__name__}: {fallback_exc}")
+        return None, None, errors
 
 
 def _matting_models() -> list[str]:
     configured = os.getenv("PORTRAIT_MATTING_MODELS", "")
     models = [item.strip() for item in configured.split(",") if item.strip()]
-    return models or ["u2net_human_seg", "u2netp", "birefnet-portrait", "isnet-general-use", "u2net"]
+    high_quality_models = ["birefnet-portrait", "bria-rmbg"]
+    if models:
+        quality = os.getenv("PORTRAIT_MATTING_QUALITY", "highest").strip().lower()
+        if quality in {"highest", "best", "high"}:
+            for model_name in reversed(high_quality_models):
+                if model_name not in models:
+                    models.insert(0, model_name)
+        return models
+    return [*high_quality_models, "u2net_human_seg", "u2netp"]
+
+
+def _is_high_quality_model(model_name: str | None) -> bool:
+    return bool(model_name and (model_name.startswith("birefnet") or model_name == "bria-rmbg"))
 
 
 def _ensure_onnx_model(model_name: str) -> Path:
@@ -296,13 +319,19 @@ def _file_md5(file_path: Path) -> str:
     return digest.hexdigest()
 
 
-def _refine_alpha(alpha: Image.Image, source: Image.Image | None = None) -> Image.Image:
+def _refine_alpha(alpha: Image.Image, source: Image.Image | None = None, model_name: str | None = None) -> Image.Image:
     alpha = _keep_primary_portrait_region(alpha)
+    if _is_high_quality_model(model_name):
+        alpha = alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.12))
+        return alpha.point(_high_quality_alpha_curve)
     alpha = alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.35))
     return alpha.point(_alpha_contrast_curve)
 
 
-def _finalize_alpha(alpha: Image.Image) -> Image.Image:
+def _finalize_alpha(alpha: Image.Image, model_name: str | None = None) -> Image.Image:
+    if _is_high_quality_model(model_name):
+        alpha = alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.10))
+        return alpha.point(_high_quality_alpha_curve)
     alpha = alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
     return alpha.filter(ImageFilter.GaussianBlur(0.16)).point(_alpha_contrast_curve)
 
@@ -317,6 +346,14 @@ def _alpha_contrast_curve(value: int) -> int:
     if value >= 236:
         return 255
     return int(((value - 24) / 212) ** 0.80 * 255)
+
+
+def _high_quality_alpha_curve(value: int) -> int:
+    if value <= 10:
+        return 0
+    if value >= 246:
+        return 255
+    return int(((value - 10) / 236) ** 0.92 * 255)
 
 
 def _alpha_bbox(alpha: Image.Image, threshold: int = 32) -> tuple[int, int, int, int] | None:
