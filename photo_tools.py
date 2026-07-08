@@ -329,10 +329,22 @@ def _assess_portrait_composition(alpha: Image.Image, source: Image.Image, spec: 
         return {"ok": False, "message": "未识别到完整人像，请重新拍摄"}
 
     left, top, right, bottom = bbox
+    face_bbox = _detect_face_like_bbox(alpha, source)
     width, height = source.size
     person_width_ratio = (right - left) / max(width, 1)
     person_height_ratio = (bottom - top) / max(height, 1)
     center_x_ratio = ((left + right) / 2) / max(width, 1)
+    face_width_ratio = None
+    face_height_ratio = None
+    face_top_ratio = None
+    face_center_x_ratio = None
+    if face_bbox:
+        face_left, face_top, face_right, face_bottom = face_bbox
+        face_width_ratio = (face_right - face_left + 1) / max(width, 1)
+        face_height_ratio = (face_bottom - face_top + 1) / max(height, 1)
+        face_top_ratio = face_top / max(height, 1)
+        face_center_x_ratio = ((face_left + face_right + 1) / 2) / max(width, 1)
+        center_x_ratio = face_center_x_ratio
     top_ratio = top / max(height, 1)
     bottom_ratio = bottom / max(height, 1)
     side_margin_ratio = min(left, width - right) / max(width, 1)
@@ -341,6 +353,10 @@ def _assess_portrait_composition(alpha: Image.Image, source: Image.Image, spec: 
         "personWidthRatio": person_width_ratio,
         "personHeightRatio": person_height_ratio,
         "centerXRatio": center_x_ratio,
+        "faceWidthRatio": face_width_ratio,
+        "faceHeightRatio": face_height_ratio,
+        "faceTopRatio": face_top_ratio,
+        "faceCenterXRatio": face_center_x_ratio,
         "topRatio": top_ratio,
         "bottomRatio": bottom_ratio,
         "sideMarginRatio": side_margin_ratio,
@@ -348,15 +364,21 @@ def _assess_portrait_composition(alpha: Image.Image, source: Image.Image, spec: 
 
     if person_width_ratio < 0.24 or person_height_ratio < 0.50:
         return {"ok": False, "message": "人像离镜头太远，请靠近后重拍", **metrics}
-    if person_width_ratio > 0.88 or top_ratio < 0.01:
+    if face_width_ratio is not None and face_width_ratio < 0.12:
+        return {"ok": False, "message": "头部离镜头太远，请靠近一点重拍", **metrics}
+    if face_width_ratio is not None and face_width_ratio > 0.46:
         return {"ok": False, "message": "人像离镜头太近或头顶出框，请后退一点重拍", **metrics}
+    if top_ratio < 0.003:
+        return {"ok": False, "message": "头顶出框，请后退一点重拍", **metrics}
     if center_x_ratio < 0.38 or center_x_ratio > 0.62:
         return {"ok": False, "message": "人像没有居中，请正对镜头重拍", **metrics}
-    if top_ratio > 0.22:
+    if face_top_ratio is not None and face_top_ratio > 0.30:
+        return {"ok": False, "message": "头部位置过低，请抬高手机或重新对准头肩", **metrics}
+    if top_ratio > 0.25:
         return {"ok": False, "message": "头部位置过低，请抬高手机或重新对准头肩", **metrics}
     if bottom_ratio < 0.72:
         return {"ok": False, "message": "肩部和上半身进入画面不足，请后退一点重拍", **metrics}
-    if side_margin_ratio < 0.005:
+    if side_margin_ratio < -0.01:
         return {"ok": False, "message": "身体或手臂贴近画面边缘，请后退并居中重拍", **metrics}
 
     return {"ok": True, **metrics}
@@ -394,6 +416,69 @@ def _assess_output_composition(alpha: Image.Image, spec: dict[str, Any] | None) 
         return {"ok": False, "message": "肩胸进入画面不足，请后退一点重拍", **metrics}
 
     return {"ok": True, **metrics}
+
+
+def _detect_face_like_bbox(alpha: Image.Image, source: Image.Image) -> tuple[int, int, int, int] | None:
+    try:
+        import numpy as np
+    except Exception:
+        return None
+
+    max_side = 560
+    scale = min(1.0, max_side / max(alpha.size))
+    analysis_size = (
+        max(1, round(alpha.width * scale)),
+        max(1, round(alpha.height * scale)),
+    )
+    analysis_alpha = alpha.resize(analysis_size, Image.Resampling.BILINEAR) if scale < 1 else alpha
+    analysis_source = source.convert("RGB").resize(analysis_size, Image.Resampling.BILINEAR)
+
+    rgb = np.asarray(analysis_source, dtype=np.uint8)
+    alpha_array = np.asarray(analysis_alpha, dtype=np.uint8)
+    person_bbox = _largest_mask_bbox(alpha_array > 40)
+    if person_bbox is None:
+        return None
+
+    person_left, person_top, person_right, person_bottom = person_bbox
+    person_width = max(1, person_right - person_left + 1)
+    person_height = max(1, person_bottom - person_top + 1)
+    face_roi_left = min(person_right, person_left + round(person_width * 0.16))
+    face_roi_right = max(face_roi_left + 1, person_right - round(person_width * 0.16))
+    face_roi_top = person_top
+    face_roi_bottom = min(analysis_alpha.height, person_top + round(person_height * 0.58))
+
+    red = rgb[:, :, 0].astype(np.int16)
+    green = rgb[:, :, 1].astype(np.int16)
+    blue = rgb[:, :, 2].astype(np.int16)
+    skin = (
+        (alpha_array > 64)
+        & (red > 66)
+        & (green > 42)
+        & (blue > 24)
+        & (red > green)
+        & ((red - blue) > 12)
+        & (green * 100 > red * 42)
+        & (blue * 100 > red * 24)
+    )
+    face_region = np.zeros_like(skin, dtype=bool)
+    face_region[face_roi_top:face_roi_bottom, face_roi_left:face_roi_right] = skin[
+        face_roi_top:face_roi_bottom,
+        face_roi_left:face_roi_right,
+    ]
+
+    bbox = _largest_mask_bbox(face_region)
+    if bbox is None:
+        return None
+
+    left, top, right, bottom = bbox
+    scale_x = alpha.width / analysis_alpha.width
+    scale_y = alpha.height / analysis_alpha.height
+    return (
+        round(left * scale_x),
+        round(top * scale_y),
+        round(right * scale_x),
+        round(bottom * scale_y),
+    )
 
 
 def _keep_primary_portrait_region(alpha: Image.Image) -> Image.Image:
