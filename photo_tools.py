@@ -13,13 +13,13 @@ from PIL import Image, ImageFilter, ImageStat
 _rembg_sessions: dict[str, Any] = {}
 _onnx_sessions: dict[str, Any] = {}
 _WARMUP_DONE = False
-_MATTING_MAX_SIDE = int(os.getenv("PORTRAIT_MATTING_MAX_SIDE", "1280"))
+_MATTING_MAX_SIDE = int(os.getenv("PORTRAIT_MATTING_MAX_SIDE", "1800"))
 _DEFAULT_COMPOSE_SPEC = {
     "width": 413,
     "height": 579,
-    "topMarginRatio": 0.065,
-    "personWidthRatio": 0.95,
-    "maxPersonHeightRatio": 1.08,
+    "topMarginRatio": 0.055,
+    "personWidthRatio": 1.08,
+    "maxPersonHeightRatio": 1.24,
 }
 
 _ONNX_MODEL_SPECS = {
@@ -93,6 +93,15 @@ def create_transparent_portrait(source_path: Path, target_path: Path, output_spe
         source_coverage = _alpha_coverage(alpha)
         if source_coverage < 0.08 or source_coverage > 0.88:
             return {"ok": False, "message": "人像边界识别失败，请换纯色背景重新拍摄", "coverage": source_coverage, "model": model_name}
+        composition = _assess_portrait_composition(alpha, source, compose_spec)
+        if not composition["ok"]:
+            return {
+                "ok": False,
+                "message": composition["message"],
+                "requiresRetake": True,
+                "composition": composition,
+                "model": model_name,
+            }
         segmented.putalpha(alpha)
 
         if compose_spec:
@@ -102,6 +111,15 @@ def create_transparent_portrait(source_path: Path, target_path: Path, output_spe
         coverage = _alpha_coverage(alpha)
         if coverage < 0.08 or coverage > 0.88:
             return {"ok": False, "message": "人像边界识别失败，请换纯色背景重新拍摄", "coverage": coverage, "model": model_name}
+        output_composition = _assess_output_composition(alpha, compose_spec)
+        if not output_composition["ok"]:
+            return {
+                "ok": False,
+                "message": output_composition["message"],
+                "requiresRetake": True,
+                "composition": output_composition,
+                "model": model_name,
+            }
 
         segmented.putalpha(alpha)
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -280,15 +298,13 @@ def _file_md5(file_path: Path) -> str:
 
 def _refine_alpha(alpha: Image.Image, source: Image.Image | None = None) -> Image.Image:
     alpha = _keep_primary_portrait_region(alpha)
-    if source is not None:
-        alpha = _apply_portrait_shape_prior(alpha, source)
-    alpha = alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.45))
+    alpha = alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.GaussianBlur(0.35))
     return alpha.point(_alpha_contrast_curve)
 
 
 def _finalize_alpha(alpha: Image.Image) -> Image.Image:
     alpha = alpha.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
-    return alpha.filter(ImageFilter.GaussianBlur(0.20)).point(_alpha_contrast_curve)
+    return alpha.filter(ImageFilter.GaussianBlur(0.16)).point(_alpha_contrast_curve)
 
 
 def _alpha_coverage(alpha: Image.Image) -> float:
@@ -296,11 +312,88 @@ def _alpha_coverage(alpha: Image.Image) -> float:
 
 
 def _alpha_contrast_curve(value: int) -> int:
-    if value <= 16:
+    if value <= 24:
         return 0
-    if value >= 242:
+    if value >= 236:
         return 255
-    return int(((value - 16) / 226) ** 0.85 * 255)
+    return int(((value - 24) / 212) ** 0.80 * 255)
+
+
+def _alpha_bbox(alpha: Image.Image, threshold: int = 32) -> tuple[int, int, int, int] | None:
+    return alpha.point(lambda value: 255 if value > threshold else 0).getbbox()
+
+
+def _assess_portrait_composition(alpha: Image.Image, source: Image.Image, spec: dict[str, Any] | None) -> dict[str, Any]:
+    bbox = _alpha_bbox(alpha, 40)
+    if not bbox:
+        return {"ok": False, "message": "未识别到完整人像，请重新拍摄"}
+
+    left, top, right, bottom = bbox
+    width, height = source.size
+    person_width_ratio = (right - left) / max(width, 1)
+    person_height_ratio = (bottom - top) / max(height, 1)
+    center_x_ratio = ((left + right) / 2) / max(width, 1)
+    top_ratio = top / max(height, 1)
+    bottom_ratio = bottom / max(height, 1)
+    side_margin_ratio = min(left, width - right) / max(width, 1)
+
+    metrics = {
+        "personWidthRatio": person_width_ratio,
+        "personHeightRatio": person_height_ratio,
+        "centerXRatio": center_x_ratio,
+        "topRatio": top_ratio,
+        "bottomRatio": bottom_ratio,
+        "sideMarginRatio": side_margin_ratio,
+    }
+
+    if person_width_ratio < 0.24 or person_height_ratio < 0.50:
+        return {"ok": False, "message": "人像离镜头太远，请靠近后重拍", **metrics}
+    if person_width_ratio > 0.88 or top_ratio < 0.01:
+        return {"ok": False, "message": "人像离镜头太近或头顶出框，请后退一点重拍", **metrics}
+    if center_x_ratio < 0.38 or center_x_ratio > 0.62:
+        return {"ok": False, "message": "人像没有居中，请正对镜头重拍", **metrics}
+    if top_ratio > 0.22:
+        return {"ok": False, "message": "头部位置过低，请抬高手机或重新对准头肩", **metrics}
+    if bottom_ratio < 0.72:
+        return {"ok": False, "message": "肩部和上半身进入画面不足，请后退一点重拍", **metrics}
+    if side_margin_ratio < 0.005:
+        return {"ok": False, "message": "身体或手臂贴近画面边缘，请后退并居中重拍", **metrics}
+
+    return {"ok": True, **metrics}
+
+
+def _assess_output_composition(alpha: Image.Image, spec: dict[str, Any] | None) -> dict[str, Any]:
+    if spec is None:
+        return {"ok": True}
+
+    bbox = _alpha_bbox(alpha, 24)
+    if not bbox:
+        return {"ok": False, "message": "成图未识别到人像，请重新拍摄"}
+
+    left, top, right, bottom = bbox
+    width = int(spec["width"])
+    height = int(spec["height"])
+    subject_width_ratio = (right - left) / max(width, 1)
+    top_ratio = top / max(height, 1)
+    bottom_ratio = bottom / max(height, 1)
+    metrics = {
+        "subjectWidthRatio": subject_width_ratio,
+        "topRatio": top_ratio,
+        "bottomRatio": bottom_ratio,
+        "left": left,
+        "right": right,
+    }
+
+    if subject_width_ratio < 0.98:
+        return {"ok": False, "message": "人像宽度不足，请靠近镜头并让肩部进入框线后重拍", **metrics}
+    if top_ratio < 0.002:
+        return {"ok": False, "message": "头顶过近，请后退一点重拍", **metrics}
+    if top_ratio > 0.13:
+        return {"ok": False, "message": "头部位置过低，请重新对准头肩", **metrics}
+    if bottom_ratio < 0.90:
+        return {"ok": False, "message": "肩胸进入画面不足，请后退一点重拍", **metrics}
+
+    return {"ok": True, **metrics}
 
 
 def _keep_primary_portrait_region(alpha: Image.Image) -> Image.Image:
@@ -539,7 +632,7 @@ def _compose_to_id_canvas(segmented: Image.Image, spec: dict[str, Any]) -> Image
     person_center_x = (left + right) / 2
     x = round((target_width / 2) - person_center_x * scale)
     y = round((target_height * top_margin_ratio) - top * scale)
-    min_bottom = target_height * 0.94
+    min_bottom = target_height * 0.96
     if bottom * scale + y < min_bottom:
         y = round(min_bottom - bottom * scale)
     if top * scale + y < 0:

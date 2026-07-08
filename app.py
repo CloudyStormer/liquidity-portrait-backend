@@ -22,12 +22,12 @@ from wechat_security import media_check_async
 
 remove_methods = {"screenshot", "doodle", "selection"}
 PHOTO_OUTPUT_SPECS = {
-    "one-inch": {"width": 295, "height": 413, "topMarginRatio": 0.065, "personWidthRatio": 0.94, "maxPersonHeightRatio": 1.08},
-    "two-inch": {"width": 413, "height": 579, "topMarginRatio": 0.065, "personWidthRatio": 0.95, "maxPersonHeightRatio": 1.08},
-    "small-one-inch": {"width": 260, "height": 378, "topMarginRatio": 0.065, "personWidthRatio": 0.94, "maxPersonHeightRatio": 1.08},
-    "large-one-inch": {"width": 390, "height": 567, "topMarginRatio": 0.065, "personWidthRatio": 0.95, "maxPersonHeightRatio": 1.08},
-    "passport": {"width": 390, "height": 567, "topMarginRatio": 0.070, "personWidthRatio": 0.94, "maxPersonHeightRatio": 1.06},
-    "social-security": {"width": 358, "height": 441, "topMarginRatio": 0.060, "personWidthRatio": 0.94, "maxPersonHeightRatio": 1.08},
+    "one-inch": {"width": 295, "height": 413, "topMarginRatio": 0.055, "personWidthRatio": 1.08, "maxPersonHeightRatio": 1.24},
+    "two-inch": {"width": 413, "height": 579, "topMarginRatio": 0.055, "personWidthRatio": 1.08, "maxPersonHeightRatio": 1.24},
+    "small-one-inch": {"width": 260, "height": 378, "topMarginRatio": 0.055, "personWidthRatio": 1.08, "maxPersonHeightRatio": 1.24},
+    "large-one-inch": {"width": 390, "height": 567, "topMarginRatio": 0.055, "personWidthRatio": 1.08, "maxPersonHeightRatio": 1.24},
+    "passport": {"width": 390, "height": 567, "topMarginRatio": 0.060, "personWidthRatio": 1.06, "maxPersonHeightRatio": 1.20},
+    "social-security": {"width": 358, "height": 441, "topMarginRatio": 0.050, "personWidthRatio": 1.06, "maxPersonHeightRatio": 1.22},
 }
 
 
